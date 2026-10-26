@@ -47,8 +47,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  MUSL_SITE: https://git.musl-libc.org/git/musl
-  MCM_REPO: https://github.com/richfelker/musl-cross-make
+  MUSL_SITE: https://musl.libc.org
+  MCM_REPO: https://git.musl-libc.org/git/musl
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -370,10 +370,18 @@ jobs:
         run: |
           set -euo pipefail
           cd "$WORKDIR/musl-cross-make"
+
+          # musl 的 libc.a 默认由非 PIC 对象（AOBJS）组成，链接 -static-pie 会失败。
+          # MUSL_VARS 只用于 musl 的子 make（见 litecross/Makefile 的 obj_musl/install-musl），
+          # 在这里追加 CFLAGS=-fPIC，一次构建即可得到支持 static-pie 的 libc.a，
+          # 且不会影响 binutils/gcc 的 host 构建。
+          MUSL_VARS="AR=../obj_binutils/binutils/ar RANLIB=../obj_binutils/binutils/ranlib CFLAGS=-fPIC"
+
           # 构建 binutils + gcc/g++ + libgcc/libstdc++ + musl，然后安装：
           # 工具链装到 output/{bin,lib,libexec}，sysroot（musl 头文件/库）装到 output/<target>
-          make -j"$(nproc)"
-          make install
+          make -j"$(nproc)" MUSL_VARS="$MUSL_VARS"
+          make MUSL_VARS="$MUSL_VARS" install
+
           ls -la "$WORKDIR/output"
 
       - name: Verify toolchain and sysroot
