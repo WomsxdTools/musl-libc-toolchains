@@ -1,9 +1,9 @@
 # 基于 musl-cross-make 在 x86_64 runner 上构建多架构交叉工具链（binutils + gcc/g++ + musl）
 #
 # 触发方式：Actions -> 本 workflow -> Run workflow（可留空版本号自动取 musl.libc.org 最新版）
-# 产物：musl-cross-<musl版本>-<构建日期(UTC)>-<架构>.tar.gz
+# 产物：musl-cross-<musl版本>-gcc<GCC版本>-<构建日期(UTC)>-<架构>.tar.gz
 #       完整的 x86_64 -> <target> 交叉工具链（含 C/C++ 编译器与 musl sysroot），解压即用
-# Release tag：musl-cross-<musl版本>-<构建日期(UTC)>，例如 musl-cross-1.2.6-20261026
+# Release tag：musl-cross-<musl版本>-gcc<GCC版本>-<构建日期(UTC)>，例如 musl-cross-1.2.6-gcc13.3.0-20261026
 #
 # 注意：工具链中的 gcc/binutils 是 x86_64 Linux 程序，动态链接构建机的 glibc；
 #       在较老发行版上使用时需确认 glibc 版本兼容性。
@@ -27,6 +27,11 @@ on:
         description: "musl 版本，例如 1.2.6；留空则自动获取 musl.libc.org 最新版本"
         required: false
         default: ""
+        type: string
+      gcc_version:
+        description: "GCC 版本（musl-cross-make 支持：9.4.0 / 10.3.0 / 11.2.0 / 11.5.0 / 12.4.0 / 13.3.0 / 14.2.0 / 14.3.0 / 15.1.0）"
+        required: false
+        default: "13.3.0"
         type: string
       publish:
         description: "构建成功后创建 Tag 与 GitHub Release"
@@ -56,6 +61,7 @@ jobs:
     outputs:
       musl_version: ${{ steps.detect.outputs.version }}
       build_date: ${{ steps.date.outputs.date }}
+      gcc_version: ${{ steps.gcc.outputs.version }}
     steps:
       - name: Detect latest musl release
         id: detect
@@ -102,6 +108,21 @@ jobs:
           echo "构建日期（UTC）：$date_utc"
           echo "date=$date_utc" >> "$GITHUB_OUTPUT"
           echo "- 构建日期（UTC）: \`$date_utc\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Resolve GCC version
+        id: gcc
+        env:
+          INPUT_GCC: ${{ inputs.gcc_version }}
+        run: |
+          set -euo pipefail
+          ver="$(printf '%s' "$INPUT_GCC" | tr -d '[:space:]')"
+          if ! printf '%s' "$ver" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::GCC 版本格式不正确：'$ver'（示例：13.3.0）"
+            exit 1
+          fi
+          echo "GCC version: $ver"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "- GCC 版本: \`$ver\`" >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
   # 2. 每个架构一个 job，并行交叉编译
@@ -151,6 +172,7 @@ jobs:
     env:
       MUSL_VER: ${{ needs.resolve.outputs.musl_version }}
       BUILD_DATE: ${{ needs.resolve.outputs.build_date }}
+      GCC_VER: ${{ needs.resolve.outputs.gcc_version }}
       TARGET: ${{ matrix.target }}
       WORKDIR: ${{ github.workspace }}
       GCC_EXTRA: ${{ matrix.gcc_extra }}
@@ -237,6 +259,91 @@ jobs:
           # 让 tarball 比 sha1 文件更新，避免 make 重复下载
           touch "sources/$tarball"
 
+      - name: Prefetch upstream source tarballs
+        run: |
+          set -euo pipefail
+          cd "$WORKDIR/musl-cross-make"
+
+          ver() { sed -n "s/^$1 = //p" Makefile; }
+          BINUTILS_VER="$(ver BINUTILS_VER)"
+          GMP_VER="$(ver GMP_VER)"
+          MPC_VER="$(ver MPC_VER)"
+          MPFR_VER="$(ver MPFR_VER)"
+          LINUX_VER="$(ver LINUX_VER)"
+
+          # GCC 版本由 workflow 输入决定；只接受 musl-cross-make 已收录（有 hash/补丁）的版本
+          GCC_HASH="$(ls hashes/gcc-${GCC_VER}.tar.* 2>/dev/null | sort | sed -n '1p' || true)"
+          if [ -z "$GCC_HASH" ]; then
+            echo "::error::musl-cross-make 不支持 GCC ${GCC_VER}，可用版本："
+            ls hashes/gcc-*.tar.* 2>/dev/null | sed -E 's#^hashes/gcc-(.*)\.tar\..*#  \1#' || true
+            exit 1
+          fi
+          GCC_TARBALL="$(basename "$GCC_HASH" .sha1)"
+
+          # ftpmirror.gnu.org 会重定向到 mirrors.ibiblio.org，make -j 的并发下载
+          # 容易触发 403 限流。这里串行地从多个镜像预取。
+          fetch_gnu() {
+            local rel="$1" out="$2" base
+            for base in \
+              https://mirrors.kernel.org/gnu \
+              https://mirrors.ocf.berkeley.edu/gnu \
+              https://ftp.gnu.org/gnu; do
+              if [ -s "$out" ]; then
+                return 0
+              fi
+              echo "==> $base/$rel"
+              if curl -fL --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 20 \
+                   -o "$out.part" "$base/$rel"; then
+                mv "$out.part" "$out"
+                return 0
+              fi
+              rm -f "$out.part"
+              echo "::warning::$base/$rel 下载失败，尝试下一个镜像"
+            done
+            return 1
+          }
+
+          fetch_gnu "binutils/binutils-${BINUTILS_VER}.tar.gz" \
+            "sources/binutils-${BINUTILS_VER}.tar.gz" \
+            || echo "::warning::binutils 预下载失败，稍后由 make 重试"
+          fetch_gnu "gcc/gcc-${GCC_VER}/${GCC_TARBALL}" \
+            "sources/${GCC_TARBALL}" \
+            || echo "::warning::gcc 预下载失败，稍后由 make 重试"
+          fetch_gnu "gmp/gmp-${GMP_VER}.tar.xz" \
+            "sources/gmp-${GMP_VER}.tar.xz" \
+            || echo "::warning::gmp 预下载失败，稍后由 make 重试"
+          fetch_gnu "mpc/mpc-${MPC_VER}.tar.gz" \
+            "sources/mpc-${MPC_VER}.tar.gz" \
+            || echo "::warning::mpc 预下载失败，稍后由 make 重试"
+          fetch_gnu "mpfr/mpfr-${MPFR_VER}.tar.xz" \
+            "sources/mpfr-${MPFR_VER}.tar.xz" \
+            || echo "::warning::mpfr 预下载失败，稍后由 make 重试"
+
+          if [ -n "$LINUX_VER" ]; then
+            LINUX_TARBALL="linux-${LINUX_VER}.tar.xz"
+            if [ ! -s "sources/$LINUX_TARBALL" ]; then
+              echo "==> linux headers: $LINUX_TARBALL"
+              if curl -fL --retry 5 --retry-all-errors --retry-delay 3 --connect-timeout 20 \
+                   -o "sources/$LINUX_TARBALL.part" \
+                   "https://ftp.barfooze.de/pub/sabotage/tarballs/$LINUX_TARBALL"; then
+                mv "sources/$LINUX_TARBALL.part" "sources/$LINUX_TARBALL"
+              else
+                rm -f "sources/$LINUX_TARBALL.part"
+                echo "::warning::linux headers 预下载失败，稍后由 make 重试"
+              fi
+            fi
+          fi
+
+          # 校验已有 hashes，并让 tarball 比 sha1 文件新，make 才不会重复下载
+          for f in sources/*.tar.gz sources/*.tar.xz sources/*.tar.bz2; do
+            [ -f "$f" ] || continue
+            base="$(basename "$f")"
+            if [ -f "hashes/$base.sha1" ]; then
+              ( cd sources && sha1sum -c "../hashes/$base.sha1" )
+            fi
+            touch "$f"
+          done
+
       - name: Configure musl-cross-make
         run: |
           set -euo pipefail
@@ -244,7 +351,10 @@ jobs:
           {
             echo "TARGET = $TARGET"
             echo "MUSL_VER = $MUSL_VER"
+            echo "GCC_VER = $GCC_VER"
             echo "OUTPUT = $WORKDIR/output"
+            # 兜底：make 自身的下载也改用 curl + 重试
+            echo "DL_CMD = curl -fL --retry 3 --retry-all-errors --retry-delay 2 -o"
             # 完整 C/C++ 交叉工具链：binutils + gcc/g++ + libstdc++ + musl sysroot
             # --disable-nls 减少体积；debug-prefix-map 保证工具链内不出现构建机路径
             echo "COMMON_CONFIG += --disable-nls"
@@ -323,7 +433,7 @@ jobs:
       - name: Package cross toolchain
         run: |
           set -euo pipefail
-          PKG="musl-cross-${MUSL_VER}-${BUILD_DATE}-${{ matrix.name }}"
+          PKG="musl-cross-${MUSL_VER}-gcc${GCC_VER}-${BUILD_DATE}-${{ matrix.name }}"
           STAGE="$WORKDIR/dist/stage/$PKG"
           rm -rf "$WORKDIR/dist/stage"
           mkdir -p "$STAGE"
@@ -385,7 +495,7 @@ jobs:
       - name: Smoke test (packaged toolchain)
         run: |
           set -euo pipefail
-          PKG="musl-cross-${MUSL_VER}-${BUILD_DATE}-${{ matrix.name }}"
+          PKG="musl-cross-${MUSL_VER}-gcc${GCC_VER}-${BUILD_DATE}-${{ matrix.name }}"
           rm -rf "/tmp/$PKG"
           tar -C /tmp -xzf "$WORKDIR/dist/$PKG.tar.gz"
           TC="/tmp/$PKG"
@@ -451,10 +561,10 @@ jobs:
       - name: Upload toolchain artifact
         uses: actions/upload-artifact@v4
         with:
-          name: musl-cross-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-${{ matrix.target }}
+          name: musl-cross-${{ env.MUSL_VER }}-gcc${{ env.GCC_VER }}-${{ env.BUILD_DATE }}-${{ matrix.target }}
           path: |
-            ${{ github.workspace }}/dist/musl-cross-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-${{ matrix.name }}.tar.gz
-            ${{ github.workspace }}/dist/musl-cross-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-${{ matrix.name }}.tar.gz.sha256
+            ${{ github.workspace }}/dist/musl-cross-${{ env.MUSL_VER }}-gcc${{ env.GCC_VER }}-${{ env.BUILD_DATE }}-${{ matrix.name }}.tar.gz
+            ${{ github.workspace }}/dist/musl-cross-${{ env.MUSL_VER }}-gcc${{ env.GCC_VER }}-${{ env.BUILD_DATE }}-${{ matrix.name }}.tar.gz.sha256
           if-no-files-found: error
           compression-level: 9
           retention-days: 7
@@ -462,7 +572,7 @@ jobs:
       - name: Write job summary
         if: always()
         run: |
-          PKG="musl-cross-${MUSL_VER}-${BUILD_DATE}-${{ matrix.name }}"
+          PKG="musl-cross-${MUSL_VER}-gcc${GCC_VER}-${BUILD_DATE}-${{ matrix.name }}"
           {
             echo "## ${PKG}"
             echo ""
@@ -497,8 +607,9 @@ jobs:
       contents: write   # softprops/action-gh-release 创建 Release、push tag 需要
     env:
       MUSL_VER: ${{ needs.resolve.outputs.musl_version }}
+      GCC_VER: ${{ needs.resolve.outputs.gcc_version }}
       BUILD_DATE: ${{ needs.resolve.outputs.build_date }}
-      TAG: musl-cross-${{ needs.resolve.outputs.musl_version }}-${{ needs.resolve.outputs.build_date }}
+      TAG: musl-cross-${{ needs.resolve.outputs.musl_version }}-gcc${{ needs.resolve.outputs.gcc_version }}-${{ needs.resolve.outputs.build_date }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -518,7 +629,7 @@ jobs:
 
           missing=0
           for arch in amd64 arm64 armv7 mips mipsle; do
-            f="dist/musl-cross-${MUSL_VER}-${BUILD_DATE}-${arch}.tar.gz"
+            f="dist/musl-cross-${MUSL_VER}-gcc${GCC_VER}-${BUILD_DATE}-${arch}.tar.gz"
             if [ ! -f "$f" ]; then
               echo "::error::缺少产物 $f"
               missing=1
@@ -552,15 +663,16 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.TAG }}
-          name: musl-cross ${{ env.MUSL_VER }} (${{ env.BUILD_DATE }})
+          name: musl-cross ${{ env.MUSL_VER }} / GCC ${{ env.GCC_VER }} (${{ env.BUILD_DATE }})
           body: |
-            ## musl-cross ${{ env.MUSL_VER }}（${{ env.BUILD_DATE }} 构建）
+            ## musl-cross ${{ env.MUSL_VER }} / GCC ${{ env.GCC_VER }}（${{ env.BUILD_DATE }} 构建）
 
             x86_64 主机上的多架构交叉编译工具链：binutils + gcc/g++ + musl sysroot，解压即用。
 
             | 项目 | 值 |
             | --- | --- |
             | musl 版本 | `${{ env.MUSL_VER }}` |
+            | GCC 版本 | `${{ env.GCC_VER }}` |
             | 构建日期（UTC） | `${{ env.BUILD_DATE }}` |
             | 构建提交 | `${{ github.sha }}` |
             | host | x86_64 Linux（gcc/binutils 动态链接 glibc） |
@@ -568,17 +680,17 @@ jobs:
 
             | 资产 | target | 说明 |
             | --- | --- | --- |
-            | `musl-cross-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-amd64.tar.gz` | `x86_64-linux-musl` | x86_64 |
-            | `musl-cross-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-arm64.tar.gz` | `aarch64-linux-musl` | AArch64 |
-            | `musl-cross-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-armv7.tar.gz` | `arm-linux-musleabihf` | ARMv7-A + VFPv3-D16，hard-float |
-            | `musl-cross-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-mips.tar.gz` | `mips-linux-muslsf` | MIPS o32，大端，soft-float |
-            | `musl-cross-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-mipsle.tar.gz` | `mipsel-linux-muslsf` | MIPS o32，小端，soft-float |
+            | `musl-cross-${{ env.MUSL_VER }}-gcc${{ env.GCC_VER }}-${{ env.BUILD_DATE }}-amd64.tar.gz` | `x86_64-linux-musl` | x86_64 |
+            | `musl-cross-${{ env.MUSL_VER }}-gcc${{ env.GCC_VER }}-${{ env.BUILD_DATE }}-arm64.tar.gz` | `aarch64-linux-musl` | AArch64 |
+            | `musl-cross-${{ env.MUSL_VER }}-gcc${{ env.GCC_VER }}-${{ env.BUILD_DATE }}-armv7.tar.gz` | `arm-linux-musleabihf` | ARMv7-A + VFPv3-D16，hard-float |
+            | `musl-cross-${{ env.MUSL_VER }}-gcc${{ env.GCC_VER }}-${{ env.BUILD_DATE }}-mips.tar.gz` | `mips-linux-muslsf` | MIPS o32，大端，soft-float |
+            | `musl-cross-${{ env.MUSL_VER }}-gcc${{ env.GCC_VER }}-${{ env.BUILD_DATE }}-mipsle.tar.gz` | `mipsel-linux-muslsf` | MIPS o32，小端，soft-float |
 
             使用（以 armv7 为例）：
 
             ```bash
-            tar -xzf musl-cross-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-armv7.tar.gz -C /opt
-            export PATH=/opt/musl-cross-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-armv7/bin:$PATH
+            tar -xzf musl-cross-${{ env.MUSL_VER }}-gcc${{ env.GCC_VER }}-${{ env.BUILD_DATE }}-armv7.tar.gz -C /opt
+            export PATH=/opt/musl-cross-${{ env.MUSL_VER }}-gcc${{ env.GCC_VER }}-${{ env.BUILD_DATE }}-armv7/bin:$PATH
 
             arm-linux-musleabihf-musl-gcc hello.c -o hello
             arm-linux-musleabihf-musl-g++ hello.cc -o hello-cpp
