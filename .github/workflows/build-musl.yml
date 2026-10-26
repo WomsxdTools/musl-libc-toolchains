@@ -1,8 +1,12 @@
-# 基于 musl-cross-make 在 x86_64 runner 上交叉编译多架构 musl
+# 基于 musl-cross-make 在 x86_64 runner 上构建多架构交叉工具链（binutils + gcc/g++ + musl）
 #
 # 触发方式：Actions -> 本 workflow -> Run workflow（可留空版本号自动取 musl.libc.org 最新版）
-# 产物：musl-<musl版本>-<构建日期(UTC)>-<架构>.tar.gz（仅含 musl 的 lib/ 与 include/，即一个可用的 musl sysroot）
-# Release tag：musl-<musl版本>-<构建日期(UTC)>，例如 musl-1.2.6-20261026
+# 产物：musl-cross-<musl版本>-<构建日期(UTC)>-<架构>.tar.gz
+#       完整的 x86_64 -> <target> 交叉工具链（含 C/C++ 编译器与 musl sysroot），解压即用
+# Release tag：musl-cross-<musl版本>-<构建日期(UTC)>，例如 musl-cross-1.2.6-20261026
+#
+# 注意：工具链中的 gcc/binutils 是 x86_64 Linux 程序，动态链接构建机的 glibc；
+#       在较老发行版上使用时需确认 glibc 版本兼容性。
 #
 # matrix 覆盖：amd64(x86_64) / arm64(aarch64) / armv7(armhf) / mips(o32) / mipsle(o32, 小端)
 # 说明：
@@ -241,12 +245,9 @@ jobs:
             echo "TARGET = $TARGET"
             echo "MUSL_VER = $MUSL_VER"
             echo "OUTPUT = $WORKDIR/output"
-            # musl 本身不需要 C++，跳过 C++ 前端与多余 target lib，显著缩短构建时间
-            echo "GCC_CONFIG += --enable-languages=c"
-            echo "GCC_CONFIG += --disable-libquadmath --disable-libgomp --disable-libitm --disable-libssp --disable-libatomic"
-            # --disable-nls 少装/少检测 gettext
+            # 完整 C/C++ 交叉工具链：binutils + gcc/g++ + libstdc++ + musl sysroot
+            # --disable-nls 减少体积；debug-prefix-map 保证工具链内不出现构建机路径
             echo "COMMON_CONFIG += --disable-nls"
-            # 让 gcc 内部不出现构建机路径（产物可在任意位置/机器使用）
             echo "GCC_CONFIG += --with-debug-prefix-map=$WORKDIR=/"
             if [ -n "$GCC_EXTRA" ]; then
               echo "GCC_CONFIG += $GCC_EXTRA"
@@ -255,24 +256,34 @@ jobs:
           echo "----- config.mak -----"
           cat config.mak
 
-      - name: Build and install musl
+      - name: Build and install cross toolchain
         run: |
           set -euo pipefail
           cd "$WORKDIR/musl-cross-make"
-          # 先并行构建 binutils + gcc(all-gcc) + libgcc + musl，再串行安装：
-          # musl 装到 output/<target>，工具链装到 output/{bin,lib}（供本 workflow 冒烟测试用）
+          # 构建 binutils + gcc/g++ + libgcc/libstdc++ + musl，然后安装：
+          # 工具链装到 output/{bin,lib,libexec}，sysroot（musl 头文件/库）装到 output/<target>
           make -j"$(nproc)"
           make install
+          ls -la "$WORKDIR/output"
 
-      - name: Verify musl artifacts
+      - name: Verify toolchain and sysroot
         run: |
           set -euo pipefail
           ROOT="$WORKDIR/output/$TARGET"
+          BIN="$WORKDIR/output/bin"
 
-          test -d "$ROOT/lib" || { echo "::error::missing $ROOT/lib"; exit 1; }
-          test -f "$ROOT/lib/libc.a" || { echo "::error::missing libc.a"; exit 1; }
-          test -d "$ROOT/include" || { echo "::error::missing include/"; exit 1; }
+          test -f "$ROOT/lib/libc.a" || { echo "::error::missing $ROOT/lib/libc.a"; exit 1; }
+          test -d "$ROOT/include" || { echo "::error::missing $ROOT/include"; exit 1; }
+          for tool in "$TARGET-gcc" "$TARGET-g++" "$TARGET-ld" "$TARGET-ar"; do
+            test -x "$BIN/$tool" || { echo "::error::missing $BIN/$tool"; exit 1; }
+          done
+          ls -l "$BIN"
           ls -l "$ROOT/lib"
+
+          # C/C++ 编译器与默认 sysroot
+          "$BIN/$TARGET-gcc" --version | sed -n '1p'
+          "$BIN/$TARGET-g++" --version | sed -n '1p'
+          echo "default sysroot: $("$BIN/$TARGET-gcc" -print-sysroot)"
 
           # arm/mips 上 lib/libc.so 可能是 linker script，真正的 ELF 是 ld-musl-*.so.1
           ELF=""
@@ -290,8 +301,6 @@ jobs:
           grep -q "$EXPECT_MACHINE" /tmp/readelf-header.txt \
             || { echo "::error::ELF machine mismatch, expected '$EXPECT_MACHINE'"; exit 1; }
 
-          # 产物不得依赖构建机：不能有 RPATH/RUNPATH，也不能出现构建目录字符串
-          # 注意：这里不用 grep -q，避免 strings/readelf 被 SIGPIPE 终止后因 pipefail 误判为“未命中”
           if readelf -d "$ELF" | grep -E 'RPATH|RUNPATH' > /dev/null; then
             echo "::error::RPATH/RUNPATH found in $ELF"
             exit 1
@@ -300,19 +309,82 @@ jobs:
             echo "::error::build-machine path leaked into $ELF"
             exit 1
           fi
-          if strings -a "$ROOT/lib/libc.a" | grep -F "$WORKDIR" > /dev/null; then
-            echo "::error::build-machine path leaked into libc.a"
-            exit 1
-          fi
 
-          echo "architecture / relocatability checks passed"
+          # 工具链二进制里不能引用构建目录，否则移动到其他机器后不可用
+          for f in "$BIN/$TARGET-gcc" "$BIN/$TARGET-g++" "$WORKDIR/output/libexec/gcc/$TARGET"/*/cc1; do
+            [ -f "$f" ] || continue
+            if strings -a "$f" | grep -F "$WORKDIR" > /dev/null; then
+              echo "::error::build-machine path leaked into $f"
+              exit 1
+            fi
+          done
 
-      - name: Smoke test (compile and run a program)
+          echo "toolchain / sysroot checks passed"
+
+      - name: Package cross toolchain
         run: |
           set -euo pipefail
-          ROOT="$WORKDIR/output/$TARGET"
-          CC="$WORKDIR/output/bin/$TARGET-gcc"
-          [ -x "$CC" ] || { echo "::error::cross gcc not found: $CC"; exit 1; }
+          PKG="musl-cross-${MUSL_VER}-${BUILD_DATE}-${{ matrix.name }}"
+          STAGE="$WORKDIR/dist/stage/$PKG"
+          rm -rf "$WORKDIR/dist/stage"
+          mkdir -p "$STAGE"
+
+          # 完整工具链：bin/（gcc/g++/binutils）、lib/、libexec/ 以及 <target>/ sysroot
+          cp -a "$WORKDIR/output/." "$STAGE/"
+
+          # 去掉文档/本地化文件，减小发布体积（不影响编译功能）
+          rm -rf "$STAGE/share/man" "$STAGE/share/info" "$STAGE/share/doc" "$STAGE/share/locale"
+
+          # strip host 端可执行文件（sysroot 里的 target 库不动）
+          find "$STAGE/bin" "$STAGE/libexec" -type f -perm -u+x -print0 \
+            | xargs -0 -r strip --strip-unneeded 2>/dev/null || true
+
+          # 相对路径 sysroot 包装器：工具链解压到任意目录都能直接编译
+          cat > "$STAGE/bin/${TARGET}-musl-gcc" <<EOF
+          #!/bin/sh
+          dir=\$(CDPATH= cd -- "\$(dirname -- "\$0")" && pwd)
+          exec "\$dir/${TARGET}-gcc" --sysroot="\$dir/../${TARGET}" "\$@"
+          EOF
+          cat > "$STAGE/bin/${TARGET}-musl-g++" <<EOF
+          #!/bin/sh
+          dir=\$(CDPATH= cd -- "\$(dirname -- "\$0")" && pwd)
+          exec "\$dir/${TARGET}-g++" --sysroot="\$dir/../${TARGET}" "\$@"
+          EOF
+          chmod +x "$STAGE/bin/${TARGET}-musl-gcc" "$STAGE/bin/${TARGET}-musl-g++"
+
+          cat > "$STAGE/README.txt" <<EOF
+          musl-cross ${MUSL_VER} (${BUILD_DATE})
+          host: $(uname -m)   target: ${TARGET}
+
+          usage:
+            export PATH="\$PWD/bin:\$PATH"
+            ${TARGET}-musl-gcc hello.c -o hello
+            ${TARGET}-musl-g++ hello.cc -o hello-cpp
+
+          ${TARGET}-musl-gcc / ${TARGET}-musl-g++ are wrappers that pass
+          --sysroot="\$PWD/${TARGET}" automatically, so this toolchain works
+          from any directory. The standard ${TARGET}-gcc / ${TARGET}-g++
+          are included as well.
+          EOF
+
+          out="$WORKDIR/dist/$PKG.tar.gz"
+          tar --sort=name --owner=0 --group=0 --numeric-owner -C "$WORKDIR/dist/stage" -czf "$out" "$PKG"
+          ( cd "$WORKDIR/dist" && sha256sum "$PKG.tar.gz" | tee "$PKG.tar.gz.sha256" )
+
+          du -sh "$out"
+          find "$STAGE" -maxdepth 1 -mindepth 1 | sort | sed "s#$STAGE/##"
+
+      - name: Smoke test (packaged toolchain)
+        run: |
+          set -euo pipefail
+          PKG="musl-cross-${MUSL_VER}-${BUILD_DATE}-${{ matrix.name }}"
+          rm -rf "/tmp/$PKG"
+          tar -C /tmp -xzf "$WORKDIR/dist/$PKG.tar.gz"
+          TC="/tmp/$PKG"
+          ROOT="$TC/$TARGET"
+
+          test -x "$TC/bin/${TARGET}-musl-gcc" || { echo "::error::missing ${TARGET}-musl-gcc"; exit 1; }
+          test -x "$TC/bin/${TARGET}-musl-g++" || { echo "::error::missing ${TARGET}-musl-g++"; exit 1; }
 
           mkdir -p /tmp/smoke
           cat > /tmp/smoke/hello.c <<'EOF'
@@ -328,79 +400,71 @@ jobs:
           }
           EOF
 
-          "$CC" --sysroot="$ROOT" -O2 -static /tmp/smoke/hello.c -o /tmp/smoke/hello-static
-          "$CC" --sysroot="$ROOT" -O2 /tmp/smoke/hello.c -o /tmp/smoke/hello-dynamic
-          file /tmp/smoke/hello-static /tmp/smoke/hello-dynamic
+          cat > /tmp/smoke/hello.cc <<'EOF'
+          #include <iostream>
+          #include <string>
+
+          int main()
+          {
+              std::string s = "hello from musl g++";
+              std::cout << s << std::endl;
+              return s.empty();
+          }
+          EOF
+
+          # 只用解压后的工具链，验证其不依赖构建机/构建目录
+          "$TC/bin/${TARGET}-musl-gcc" -O2 -static /tmp/smoke/hello.c -o /tmp/smoke/hello-static
+          "$TC/bin/${TARGET}-musl-gcc" -O2 /tmp/smoke/hello.c -o /tmp/smoke/hello-dynamic
+          "$TC/bin/${TARGET}-musl-g++" -O2 -static /tmp/smoke/hello.cc -o /tmp/smoke/hello-cxx
+          file /tmp/smoke/hello-static /tmp/smoke/hello-dynamic /tmp/smoke/hello-cxx
 
           if [ -n "$QEMU" ] && command -v "$QEMU" > /dev/null 2>&1; then
             echo "running under $QEMU (sysroot: $ROOT)"
             "$QEMU" /tmp/smoke/hello-static
             "$QEMU" -L "$ROOT" /tmp/smoke/hello-dynamic
+            "$QEMU" /tmp/smoke/hello-cxx
           elif [ "$TARGET" = "x86_64-linux-musl" ]; then
             echo "running natively"
             /tmp/smoke/hello-static
             "$ROOT/lib/ld-musl-x86_64.so.1" /tmp/smoke/hello-dynamic
+            /tmp/smoke/hello-cxx
           else
-            echo "::warning::没有可用的 $TARGET 模拟器，跳过运行测试（仅做了 ELF 校验）"
+            echo "::warning::没有可用的 $TARGET 模拟器，跳过运行测试"
           fi
 
-      - name: Package musl sysroot
-        run: |
-          set -euo pipefail
-          ROOT="$WORKDIR/output/$TARGET"
-          STAGE="$WORKDIR/dist/stage"
-          rm -rf "$STAGE"
-          mkdir -p "$STAGE" "$WORKDIR/dist"
-
-          cp -a "$ROOT/lib" "$STAGE/lib"
-          cp -a "$ROOT/include" "$STAGE/include"
-
-          # 只保留 musl 本身，去掉 gcc 运行时库与工具链专用文件
-          find "$STAGE/lib" -maxdepth 1 \
-            \( -name 'libgcc*' -o -name 'libstdc++*' -o -name 'libsupc++*' \
-               -o -name 'libatomic*' -o -name 'libgomp*' -o -name 'libitm*' \
-               -o -name 'libssp*' -o -name 'libquadmath*' -o -name 'musl-gcc.specs' \) \
-            -delete
-
-          (
-            cd "$STAGE"
-            find . \( -type f -o -type l \) | sort
-          ) | tee "$WORKDIR/dist/CONTENTS-${{ matrix.name }}.txt"
-
-          out="$WORKDIR/dist/musl-$MUSL_VER-$BUILD_DATE-${{ matrix.name }}.tar.gz"
-          tar --sort=name --owner=0 --group=0 --numeric-owner -C "$STAGE" -czf "$out" .
-          ( cd "$WORKDIR/dist" && sha256sum "$(basename "$out")" | tee "$(basename "$out").sha256" )
-
-      - name: Upload musl artifact
+      - name: Upload toolchain artifact
         uses: actions/upload-artifact@v4
         with:
-          name: musl-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-${{ matrix.target }}
+          name: musl-cross-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-${{ matrix.target }}
           path: |
-            ${{ github.workspace }}/dist/musl-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-${{ matrix.name }}.tar.gz
-            ${{ github.workspace }}/dist/musl-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-${{ matrix.name }}.tar.gz.sha256
-            ${{ github.workspace }}/dist/CONTENTS-${{ matrix.name }}.txt
+            ${{ github.workspace }}/dist/musl-cross-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-${{ matrix.name }}.tar.gz
+            ${{ github.workspace }}/dist/musl-cross-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-${{ matrix.name }}.tar.gz.sha256
           if-no-files-found: error
-          retention-days: 30
+          compression-level: 9
+          retention-days: 7
 
       - name: Write job summary
         if: always()
         run: |
+          PKG="musl-cross-${MUSL_VER}-${BUILD_DATE}-${{ matrix.name }}"
           {
-            echo "## musl ${MUSL_VER} / ${{ matrix.name }}"
+            echo "## ${PKG}"
             echo ""
             echo "| 项目 | 值 |"
             echo "| --- | --- |"
-            echo "| 版本 | \`${MUSL_VER}\` |"
+            echo "| musl 版本 | \`${MUSL_VER}\` |"
             echo "| 构建日期 | \`${BUILD_DATE}\` |"
-            echo "| target | \`${TARGET}\` |"
-            echo "| 构建机 | \`$(uname -m)\` / \`$(nproc)\` cores |"
-            echo "| 产物 | \`musl-${MUSL_VER}-${BUILD_DATE}-${{ matrix.name }}.tar.gz\` |"
+            echo "| host -> target | \`$(uname -m)\` -> \`${TARGET}\` |"
+            echo "| 构建机 | \`$(nproc)\` cores |"
+            echo "| 产物 | \`${PKG}.tar.gz\` |"
             echo ""
-            echo "解压到目标 sysroot 后即可用 \`--sysroot\` 使用："
+            echo "解压后即可使用（包含 gcc/g++/binutils + musl sysroot）："
             echo ""
             echo '```'
-            echo "mkdir -p /opt/musl-${{ matrix.name }}"
-            echo "tar -C /opt/musl-${{ matrix.name }} -xzf musl-${MUSL_VER}-${BUILD_DATE}-${{ matrix.name }}.tar.gz"
+            echo "tar -xzf ${PKG}.tar.gz -C /opt"
+            echo "export PATH=/opt/${PKG}/bin:\$PATH"
+            echo "${TARGET}-musl-gcc hello.c -o hello"
+            echo "${TARGET}-musl-g++ hello.cc -o hello-cpp"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -418,7 +482,7 @@ jobs:
     env:
       MUSL_VER: ${{ needs.resolve.outputs.musl_version }}
       BUILD_DATE: ${{ needs.resolve.outputs.build_date }}
-      TAG: musl-${{ needs.resolve.outputs.musl_version }}-${{ needs.resolve.outputs.build_date }}
+      TAG: musl-cross-${{ needs.resolve.outputs.musl_version }}-${{ needs.resolve.outputs.build_date }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -438,7 +502,7 @@ jobs:
 
           missing=0
           for arch in amd64 arm64 armv7 mips mipsle; do
-            f="dist/musl-${MUSL_VER}-${BUILD_DATE}-${arch}.tar.gz"
+            f="dist/musl-cross-${MUSL_VER}-${BUILD_DATE}-${arch}.tar.gz"
             if [ ! -f "$f" ]; then
               echo "::error::缺少产物 $f"
               missing=1
@@ -446,7 +510,7 @@ jobs:
           done
           [ "$missing" -eq 0 ]
 
-          ( cd dist && sha256sum musl-*.tar.gz | sort -k2 > SHA256SUMS )
+          ( cd dist && sha256sum musl-cross-*.tar.gz | sort -k2 > SHA256SUMS )
           cat dist/SHA256SUMS
 
       - name: Check if tag exists
@@ -472,33 +536,40 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.TAG }}
-          name: musl ${{ env.MUSL_VER }} (${{ env.BUILD_DATE }})
+          name: musl-cross ${{ env.MUSL_VER }} (${{ env.BUILD_DATE }})
           body: |
-            ## musl ${{ env.MUSL_VER }}（${{ env.BUILD_DATE }} 构建，多架构交叉编译）
+            ## musl-cross ${{ env.MUSL_VER }}（${{ env.BUILD_DATE }} 构建）
+
+            x86_64 主机上的多架构交叉编译工具链：binutils + gcc/g++ + musl sysroot，解压即用。
 
             | 项目 | 值 |
             | --- | --- |
             | musl 版本 | `${{ env.MUSL_VER }}` |
             | 构建日期（UTC） | `${{ env.BUILD_DATE }}` |
             | 构建提交 | `${{ github.sha }}` |
-            | 构建方式 | x86_64 runner + [musl-cross-make](https://github.com/richfelker/musl-cross-make) 交叉编译 |
+            | host | x86_64 Linux（gcc/binutils 动态链接 glibc） |
+            | 构建方式 | [musl-cross-make](https://github.com/richfelker/musl-cross-make) |
 
             | 资产 | target | 说明 |
             | --- | --- | --- |
-            | `musl-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-amd64.tar.gz` | `x86_64-linux-musl` | x86_64 |
-            | `musl-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-arm64.tar.gz` | `aarch64-linux-musl` | AArch64 |
-            | `musl-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-armv7.tar.gz` | `arm-linux-musleabihf` | ARMv7-A + VFPv3-D16，hard-float |
-            | `musl-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-mips.tar.gz` | `mips-linux-muslsf` | MIPS o32，大端，soft-float |
-            | `musl-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-mipsle.tar.gz` | `mipsel-linux-muslsf` | MIPS o32，小端，soft-float |
+            | `musl-cross-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-amd64.tar.gz` | `x86_64-linux-musl` | x86_64 |
+            | `musl-cross-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-arm64.tar.gz` | `aarch64-linux-musl` | AArch64 |
+            | `musl-cross-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-armv7.tar.gz` | `arm-linux-musleabihf` | ARMv7-A + VFPv3-D16，hard-float |
+            | `musl-cross-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-mips.tar.gz` | `mips-linux-muslsf` | MIPS o32，大端，soft-float |
+            | `musl-cross-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-mipsle.tar.gz` | `mipsel-linux-muslsf` | MIPS o32，小端，soft-float |
 
-            每个 tarball 只包含 musl 的 `lib/` 与 `include/`，解压后即可作为 sysroot 使用：
+            使用（以 armv7 为例）：
 
             ```bash
-            mkdir -p /opt/musl-armv7
-            tar -C /opt/musl-armv7 -xzf musl-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-armv7.tar.gz
-            arm-linux-musleabihf-gcc --sysroot=/opt/musl-armv7 hello.c
+            tar -xzf musl-cross-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-armv7.tar.gz -C /opt
+            export PATH=/opt/musl-cross-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-armv7/bin:$PATH
+
+            arm-linux-musleabihf-musl-gcc hello.c -o hello
+            arm-linux-musleabihf-musl-g++ hello.cc -o hello-cpp
             ```
 
+            - `*-musl-gcc` / `*-musl-g++` 会自动带上相对路径的 `--sysroot`，工具链可解压到任意目录
+            - 包内同时包含标准的 `<target>-gcc` / `<target>-g++` 与 binutils
             - 校验：`sha256sum -c SHA256SUMS`
             - `mips` / `mipsle` 默认 soft-float（o32）；需要 hard-float 时修改 workflow matrix 中的 target 后重新运行
           draft: false
@@ -507,9 +578,8 @@ jobs:
           make_latest: true
           overwrite_files: true
           files: |
-            dist/musl-*.tar.gz
+            dist/musl-cross-*.tar.gz
             dist/SHA256SUMS
-            dist/CONTENTS-*.txt
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
