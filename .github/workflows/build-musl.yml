@@ -47,7 +47,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  MUSL_SITE: https://musl.libc.org
+  MUSL_SITE: https://git.musl-libc.org/git/musl
   MCM_REPO: https://github.com/richfelker/musl-cross-make
 
 jobs:
@@ -384,6 +384,8 @@ jobs:
 
           test -f "$ROOT/lib/libc.a" || { echo "::error::missing $ROOT/lib/libc.a"; exit 1; }
           test -d "$ROOT/include" || { echo "::error::missing $ROOT/include"; exit 1; }
+          # static-pie 需要 musl 的 rcrt1.o（自定位启动代码）
+          test -f "$ROOT/lib/rcrt1.o" || { echo "::error::missing $ROOT/lib/rcrt1.o (static-pie)"; exit 1; }
           for tool in "$TARGET-gcc" "$TARGET-g++" "$TARGET-ld" "$TARGET-ar"; do
             test -x "$BIN/$tool" || { echo "::error::missing $BIN/$tool"; exit 1; }
           done
@@ -541,18 +543,22 @@ jobs:
           # 只用解压后的工具链，验证其不依赖构建机/构建目录
           "$TC/bin/${TARGET}-musl-gcc" -O2 -static /tmp/smoke/hello.c -o /tmp/smoke/hello-static
           "$TC/bin/${TARGET}-musl-gcc" -O2 /tmp/smoke/hello.c -o /tmp/smoke/hello-dynamic
+          # static-pie：musl 提供 rcrt1.o，musl-cross-make 为 GCC 应用了 static-pie 补丁
+          "$TC/bin/${TARGET}-musl-gcc" -O2 -fPIE -static-pie /tmp/smoke/hello.c -o /tmp/smoke/hello-static-pie
           "$TC/bin/${TARGET}-musl-g++" -O2 -static /tmp/smoke/hello.cc -o /tmp/smoke/hello-cxx
-          file /tmp/smoke/hello-static /tmp/smoke/hello-dynamic /tmp/smoke/hello-cxx
+          file /tmp/smoke/hello-static /tmp/smoke/hello-dynamic /tmp/smoke/hello-static-pie /tmp/smoke/hello-cxx
 
           if [ -n "$QEMU" ] && command -v "$QEMU" > /dev/null 2>&1; then
             echo "running under $QEMU (sysroot: $ROOT)"
             "$QEMU" /tmp/smoke/hello-static
             "$QEMU" -L "$ROOT" /tmp/smoke/hello-dynamic
+            "$QEMU" /tmp/smoke/hello-static-pie
             "$QEMU" /tmp/smoke/hello-cxx
           elif [ "$TARGET" = "x86_64-linux-musl" ]; then
             echo "running natively"
             /tmp/smoke/hello-static
             "$ROOT/lib/ld-musl-x86_64.so.1" /tmp/smoke/hello-dynamic
+            /tmp/smoke/hello-static-pie
             /tmp/smoke/hello-cxx
           else
             echo "::warning::没有可用的 $TARGET 模拟器，跳过运行测试"
