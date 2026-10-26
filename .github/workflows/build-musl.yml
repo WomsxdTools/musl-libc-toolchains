@@ -310,14 +310,13 @@ jobs:
             exit 1
           fi
 
-          # 工具链二进制里不能引用构建目录，否则移动到其他机器后不可用
-          for f in "$BIN/$TARGET-gcc" "$BIN/$TARGET-g++" "$WORKDIR/output/libexec/gcc/$TARGET"/*/cc1; do
-            [ -f "$f" ] || continue
-            if strings -a "$f" | grep -F "$WORKDIR" > /dev/null; then
-              echo "::error::build-machine path leaked into $f"
-              exit 1
-            fi
-          done
+          # target 侧的 musl 库不应包含构建路径。
+          # 注意：host 工具链二进制里出现 --with-build-sysroot 等构建期配置路径是正常的，
+          # 不能据此判定不可移动；真正的可移动性由打包后的解压编译测试验证。
+          if strings -a "$ROOT/lib/libc.a" | grep -F "$WORKDIR" > /dev/null; then
+            echo "::error::build-machine path leaked into libc.a"
+            exit 1
+          fi
 
           echo "toolchain / sysroot checks passed"
 
@@ -331,6 +330,15 @@ jobs:
 
           # 完整工具链：bin/（gcc/g++/binutils）、lib/、libexec/ 以及 <target>/ sysroot
           cp -a "$WORKDIR/output/." "$STAGE/"
+
+          # musl 安装的 ld-musl-*.so.1 默认是指向 /lib/libc.so 的绝对链接，
+          # 在可移动 sysroot 中会被解析到宿主机 /lib；改成同目录相对链接
+          for dso in "$STAGE/$TARGET"/lib/ld-musl-*.so.1; do
+            [ -L "$dso" ] || continue
+            case "$(readlink "$dso")" in
+              /*) ln -sfn libc.so "$dso" ;;
+            esac
+          done
 
           # 去掉文档/本地化文件，减小发布体积（不影响编译功能）
           rm -rf "$STAGE/share/man" "$STAGE/share/info" "$STAGE/share/doc" "$STAGE/share/locale"
@@ -385,6 +393,14 @@ jobs:
 
           test -x "$TC/bin/${TARGET}-musl-gcc" || { echo "::error::missing ${TARGET}-musl-gcc"; exit 1; }
           test -x "$TC/bin/${TARGET}-musl-g++" || { echo "::error::missing ${TARGET}-musl-g++"; exit 1; }
+
+          # gcc 的默认 sysroot 是相对于自身位置的，应跟随解压目录
+          relocated="$("$TC/bin/${TARGET}-gcc" -print-sysroot)"
+          echo "relocated default sysroot: $relocated"
+          case "$relocated" in
+            "$TC"*) echo "standard gcc sysroot follows the toolchain location" ;;
+            *) echo "::warning::standard gcc default sysroot is $relocated; use ${TARGET}-musl-gcc wrapper" ;;
+          esac
 
           mkdir -p /tmp/smoke
           cat > /tmp/smoke/hello.c <<'EOF'
