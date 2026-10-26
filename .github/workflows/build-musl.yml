@@ -1,0 +1,515 @@
+# 基于 musl-cross-make 在 x86_64 runner 上交叉编译多架构 musl
+#
+# 触发方式：Actions -> 本 workflow -> Run workflow（可留空版本号自动取 musl.libc.org 最新版）
+# 产物：musl-<musl版本>-<构建日期(UTC)>-<架构>.tar.gz（仅含 musl 的 lib/ 与 include/，即一个可用的 musl sysroot）
+# Release tag：musl-<musl版本>-<构建日期(UTC)>，例如 musl-1.2.6-20261026
+#
+# matrix 覆盖：amd64(x86_64) / arm64(aarch64) / armv7(armhf) / mips(o32) / mipsle(o32, 小端)
+# 说明：
+#   - MIPS 默认使用 soft-float（target 带 sf 后缀），适配常见 mips/mipsel 嵌入式设备；
+#     若目标为 hard-float，把 matrix 中的 target 改成 mips-linux-musl / mipsel-linux-musl。
+#   - 需要给 musl 打补丁时，在本仓库根目录放 patches/musl-<版本>/*.patch，
+#     workflow 会复制到 musl-cross-make/patches/（解包时自动应用）。
+#   - 可移植性：musl-cross-make 不写死绝对路径；构建完成后会校验产物中不含构建机路径、
+#     无 RPATH/RUNPATH，并用 QEMU 在隔离 sysroot 中实际运行编译出的程序。
+
+name: Build musl (multi-arch cross compile)
+
+on:
+  # 仅手动触发
+  workflow_dispatch:
+    inputs:
+      musl_version:
+        description: "musl 版本，例如 1.2.6；留空则自动获取 musl.libc.org 最新版本"
+        required: false
+        default: ""
+        type: string
+      publish:
+        description: "构建成功后创建 Tag 与 GitHub Release"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-musl-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  MUSL_SITE: https://musl.libc.org
+  MCM_REPO: https://github.com/richfelker/musl-cross-make
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. 解析要构建的 musl 版本（默认取官方发布页上的最新版）
+  # ---------------------------------------------------------------------------
+  resolve:
+    name: Resolve musl version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      musl_version: ${{ steps.detect.outputs.version }}
+      build_date: ${{ steps.date.outputs.date }}
+    steps:
+      - name: Detect latest musl release
+        id: detect
+        env:
+          INPUT_VERSION: ${{ inputs.musl_version }}
+        run: |
+          set -euo pipefail
+          ver="$(printf '%s' "$INPUT_VERSION" | tr -d '[:space:]' | sed -E 's/^v//')"
+
+          if [ -z "$ver" ]; then
+            ver="$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 --connect-timeout 20 \
+              "$MUSL_SITE/releases.html" \
+              | grep -oE 'releases/musl-[0-9]+(\.[0-9]+){1,2}\.tar\.gz' \
+              | sed -E 's#^releases/musl-##; s#\.tar\.gz$##' \
+              | sort -uV | tail -n1 || true)"
+          fi
+
+          if [ -z "$ver" ]; then
+            echo "::warning::解析 releases.html 失败，回退到 git tag"
+            ver="$(git ls-remote --tags --refs https://github.com/bminor/musl.git 'refs/tags/v*' \
+              | sed -nE 's#.*refs/tags/v##p' \
+              | grep -E '^[0-9]+(\.[0-9]+){1,2}$' \
+              | sort -V | tail -n1 || true)"
+          fi
+
+          if ! printf '%s' "$ver" | grep -qE '^[0-9]+(\.[0-9]+){1,2}$'; then
+            echo "::error::无法确定 musl 版本（得到 '$ver'），请在手动触发时指定 musl_version"
+            exit 1
+          fi
+
+          echo "musl version: $ver"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          {
+            echo "## 解析结果"
+            echo ""
+            echo "- musl 版本: \`$ver\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Compute build date (UTC)
+        id: date
+        run: |
+          set -euo pipefail
+          date_utc="$(date -u +%Y%m%d)"
+          echo "构建日期（UTC）：$date_utc"
+          echo "date=$date_utc" >> "$GITHUB_OUTPUT"
+          echo "- 构建日期（UTC）: \`$date_utc\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 2. 每个架构一个 job，并行交叉编译
+  # ---------------------------------------------------------------------------
+  build:
+    name: ${{ matrix.name }}
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: amd64
+            target: x86_64-linux-musl
+            machine: X86-64
+            qemu: ""
+            gcc_extra: ""
+
+          - name: arm64
+            target: aarch64-linux-musl
+            machine: AArch64
+            qemu: qemu-aarch64-static
+            gcc_extra: ""
+
+          - name: armv7
+            # armhf：ARMv7-A + VFPv3-D16 + hard-float
+            target: arm-linux-musleabihf
+            machine: ARM
+            qemu: qemu-arm-static
+            gcc_extra: "--with-arch=armv7-a --with-fpu=vfpv3-d16"
+
+          - name: mips
+            # 若目标为 hard-float，改为 mips-linux-musl
+            target: mips-linux-muslsf
+            machine: MIPS
+            qemu: qemu-mips-static
+            gcc_extra: ""
+
+          - name: mipsle
+            # 小端 MIPS；若目标为 hard-float，改为 mipsel-linux-musl
+            target: mipsel-linux-muslsf
+            machine: MIPS
+            qemu: qemu-mipsel-static
+            gcc_extra: ""
+
+    env:
+      MUSL_VER: ${{ needs.resolve.outputs.musl_version }}
+      BUILD_DATE: ${{ needs.resolve.outputs.build_date }}
+      TARGET: ${{ matrix.target }}
+      WORKDIR: ${{ github.workspace }}
+      GCC_EXTRA: ${{ matrix.gcc_extra }}
+      QEMU: ${{ matrix.qemu }}
+      EXPECT_MACHINE: ${{ matrix.machine }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bison flex gawk patch m4 texinfo xz-utils file \
+            wget curl ca-certificates
+          # 运行时冒烟测试用；拿不到就跳过运行测试，不影响产物
+          sudo apt-get install -y --no-install-recommends qemu-user-static \
+            || echo "::warning::qemu-user-static 不可用，将跳过运行时冒烟测试"
+
+      - name: Fetch musl-cross-make
+        run: |
+          set -euo pipefail
+          git clone --depth 1 "$MCM_REPO" "$WORKDIR/musl-cross-make"
+          git -C "$WORKDIR/musl-cross-make" log -1 --format='musl-cross-make commit: %H %s'
+
+      - name: Apply optional local patches
+        run: |
+          set -euo pipefail
+          # 仓库根目录若存在 patches/musl-<版本>/*.patch，则交给 musl-cross-make 在解包时应用
+          if [ -d "$WORKDIR/patches" ]; then
+            cp -a "$WORKDIR/patches/." "$WORKDIR/musl-cross-make/patches/"
+            find "$WORKDIR/musl-cross-make/patches" -name '*.patch' | sort
+          else
+            echo "no local patches directory, skipped"
+          fi
+
+      - name: Restore upstream tarball cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/musl-cross-make/sources
+          key: musl-cross-make-sources-v1
+          restore-keys: |
+            musl-cross-make-sources-
+
+      - name: Prepare musl source tarball
+        run: |
+          set -euo pipefail
+          cd "$WORKDIR/musl-cross-make"
+          mkdir -p sources hashes
+
+          # 缓存恢复的 tarball mtime 通常早于本次 clone 出来的 hashes/*.sha1，
+          # make 会误判为过期并重新下载；统一 touch，缓存才真正生效
+          find sources -maxdepth 1 -type f \
+            \( -name '*.tar.gz' -o -name '*.tar.xz' -o -name '*.tar.bz2' \) \
+            -exec touch {} +
+
+          tarball="musl-${MUSL_VER}.tar.gz"
+          if [ -s "sources/$tarball" ] && ! tar -tzf "sources/$tarball" > /dev/null 2>&1; then
+            echo "cached $tarball 已损坏，重新下载"
+            rm -f "sources/$tarball"
+          fi
+          if [ ! -s "sources/$tarball" ]; then
+            echo "Downloading $MUSL_SITE/releases/$tarball"
+            curl -fL --retry 5 --retry-all-errors --retry-delay 3 --connect-timeout 20 \
+              -o "sources/$tarball.part" "$MUSL_SITE/releases/$tarball"
+            mv "sources/$tarball.part" "sources/$tarball"
+          fi
+
+          # gzip 完整性检查（截断的下载会在这里失败）
+          tar -tzf "sources/$tarball" > /dev/null
+          sha256sum "sources/$tarball" | tee -a "$GITHUB_STEP_SUMMARY"
+
+          # musl-cross-make 只下载 hashes/ 里已收录的版本；
+          # 若最新版还没被收录，这里补一个 sha1，make 才不会报 "no rule to make target"
+          if [ ! -f "hashes/$tarball.sha1" ]; then
+            echo "hashes/$tarball.sha1 不存在，生成之"
+            ( cd sources && sha1sum "$tarball" > "../hashes/$tarball.sha1" )
+          fi
+          ( cd sources && sha1sum -c "../hashes/$tarball.sha1" )
+
+          # 让 tarball 比 sha1 文件更新，避免 make 重复下载
+          touch "sources/$tarball"
+
+      - name: Configure musl-cross-make
+        run: |
+          set -euo pipefail
+          cd "$WORKDIR/musl-cross-make"
+          {
+            echo "TARGET = $TARGET"
+            echo "MUSL_VER = $MUSL_VER"
+            echo "OUTPUT = $WORKDIR/output"
+            # musl 本身不需要 C++，跳过 C++ 前端与多余 target lib，显著缩短构建时间
+            echo "GCC_CONFIG += --enable-languages=c"
+            echo "GCC_CONFIG += --disable-libquadmath --disable-libgomp --disable-libitm --disable-libssp --disable-libatomic"
+            # --disable-nls 少装/少检测 gettext
+            echo "COMMON_CONFIG += --disable-nls"
+            # 让 gcc 内部不出现构建机路径（产物可在任意位置/机器使用）
+            echo "GCC_CONFIG += --with-debug-prefix-map=$WORKDIR=/"
+            if [ -n "$GCC_EXTRA" ]; then
+              echo "GCC_CONFIG += $GCC_EXTRA"
+            fi
+          } > config.mak
+          echo "----- config.mak -----"
+          cat config.mak
+
+      - name: Build and install musl
+        run: |
+          set -euo pipefail
+          cd "$WORKDIR/musl-cross-make"
+          # 先并行构建 binutils + gcc(all-gcc) + libgcc + musl，再串行安装：
+          # musl 装到 output/<target>，工具链装到 output/{bin,lib}（供本 workflow 冒烟测试用）
+          make -j"$(nproc)"
+          make install
+
+      - name: Verify musl artifacts
+        run: |
+          set -euo pipefail
+          ROOT="$WORKDIR/output/$TARGET"
+
+          test -d "$ROOT/lib" || { echo "::error::missing $ROOT/lib"; exit 1; }
+          test -f "$ROOT/lib/libc.a" || { echo "::error::missing libc.a"; exit 1; }
+          test -d "$ROOT/include" || { echo "::error::missing include/"; exit 1; }
+          ls -l "$ROOT/lib"
+
+          # arm/mips 上 lib/libc.so 可能是 linker script，真正的 ELF 是 ld-musl-*.so.1
+          ELF=""
+          for f in "$ROOT"/lib/ld-musl-*.so.1 "$ROOT"/lib/libc.so; do
+            [ -e "$f" ] || continue
+            if readelf -h "$f" > /dev/null 2>&1; then
+              ELF="$(readlink -f "$f")"
+              break
+            fi
+          done
+          [ -n "$ELF" ] || { echo "::error::no ELF shared object found in $ROOT/lib"; exit 1; }
+
+          echo "runtime ELF: $ELF"
+          readelf -h "$ELF" | tee /tmp/readelf-header.txt
+          grep -q "$EXPECT_MACHINE" /tmp/readelf-header.txt \
+            || { echo "::error::ELF machine mismatch, expected '$EXPECT_MACHINE'"; exit 1; }
+
+          # 产物不得依赖构建机：不能有 RPATH/RUNPATH，也不能出现构建目录字符串
+          # 注意：这里不用 grep -q，避免 strings/readelf 被 SIGPIPE 终止后因 pipefail 误判为“未命中”
+          if readelf -d "$ELF" | grep -E 'RPATH|RUNPATH' > /dev/null; then
+            echo "::error::RPATH/RUNPATH found in $ELF"
+            exit 1
+          fi
+          if strings -a "$ELF" | grep -F "$WORKDIR" > /dev/null; then
+            echo "::error::build-machine path leaked into $ELF"
+            exit 1
+          fi
+          if strings -a "$ROOT/lib/libc.a" | grep -F "$WORKDIR" > /dev/null; then
+            echo "::error::build-machine path leaked into libc.a"
+            exit 1
+          fi
+
+          echo "architecture / relocatability checks passed"
+
+      - name: Smoke test (compile and run a program)
+        run: |
+          set -euo pipefail
+          ROOT="$WORKDIR/output/$TARGET"
+          CC="$WORKDIR/output/bin/$TARGET-gcc"
+          [ -x "$CC" ] || { echo "::error::cross gcc not found: $CC"; exit 1; }
+
+          mkdir -p /tmp/smoke
+          cat > /tmp/smoke/hello.c <<'EOF'
+          #include <stdio.h>
+          #include <string.h>
+
+          int main(void)
+          {
+              char buf[64];
+              snprintf(buf, sizeof buf, "hello from musl %s", "libc");
+              puts(buf);
+              return strcmp(buf, "hello from musl libc") != 0;
+          }
+          EOF
+
+          "$CC" --sysroot="$ROOT" -O2 -static /tmp/smoke/hello.c -o /tmp/smoke/hello-static
+          "$CC" --sysroot="$ROOT" -O2 /tmp/smoke/hello.c -o /tmp/smoke/hello-dynamic
+          file /tmp/smoke/hello-static /tmp/smoke/hello-dynamic
+
+          if [ -n "$QEMU" ] && command -v "$QEMU" > /dev/null 2>&1; then
+            echo "running under $QEMU (sysroot: $ROOT)"
+            "$QEMU" /tmp/smoke/hello-static
+            "$QEMU" -L "$ROOT" /tmp/smoke/hello-dynamic
+          elif [ "$TARGET" = "x86_64-linux-musl" ]; then
+            echo "running natively"
+            /tmp/smoke/hello-static
+            "$ROOT/lib/ld-musl-x86_64.so.1" /tmp/smoke/hello-dynamic
+          else
+            echo "::warning::没有可用的 $TARGET 模拟器，跳过运行测试（仅做了 ELF 校验）"
+          fi
+
+      - name: Package musl sysroot
+        run: |
+          set -euo pipefail
+          ROOT="$WORKDIR/output/$TARGET"
+          STAGE="$WORKDIR/dist/stage"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE" "$WORKDIR/dist"
+
+          cp -a "$ROOT/lib" "$STAGE/lib"
+          cp -a "$ROOT/include" "$STAGE/include"
+
+          # 只保留 musl 本身，去掉 gcc 运行时库与工具链专用文件
+          find "$STAGE/lib" -maxdepth 1 \
+            \( -name 'libgcc*' -o -name 'libstdc++*' -o -name 'libsupc++*' \
+               -o -name 'libatomic*' -o -name 'libgomp*' -o -name 'libitm*' \
+               -o -name 'libssp*' -o -name 'libquadmath*' -o -name 'musl-gcc.specs' \) \
+            -delete
+
+          (
+            cd "$STAGE"
+            find . \( -type f -o -type l \) | sort
+          ) | tee "$WORKDIR/dist/CONTENTS-${{ matrix.name }}.txt"
+
+          out="$WORKDIR/dist/musl-$MUSL_VER-$BUILD_DATE-${{ matrix.name }}.tar.gz"
+          tar --sort=name --owner=0 --group=0 --numeric-owner -C "$STAGE" -czf "$out" .
+          ( cd "$WORKDIR/dist" && sha256sum "$(basename "$out")" | tee "$(basename "$out").sha256" )
+
+      - name: Upload musl artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: musl-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-${{ matrix.target }}
+          path: |
+            ${{ github.workspace }}/dist/musl-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-${{ matrix.name }}.tar.gz
+            ${{ github.workspace }}/dist/musl-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-${{ matrix.name }}.tar.gz.sha256
+            ${{ github.workspace }}/dist/CONTENTS-${{ matrix.name }}.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo "## musl ${MUSL_VER} / ${{ matrix.name }}"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 版本 | \`${MUSL_VER}\` |"
+            echo "| 构建日期 | \`${BUILD_DATE}\` |"
+            echo "| target | \`${TARGET}\` |"
+            echo "| 构建机 | \`$(uname -m)\` / \`$(nproc)\` cores |"
+            echo "| 产物 | \`musl-${MUSL_VER}-${BUILD_DATE}-${{ matrix.name }}.tar.gz\` |"
+            echo ""
+            echo "解压到目标 sysroot 后即可用 \`--sysroot\` 使用："
+            echo ""
+            echo '```'
+            echo "mkdir -p /opt/musl-${{ matrix.name }}"
+            echo "tar -C /opt/musl-${{ matrix.name }} -xzf musl-${MUSL_VER}-${BUILD_DATE}-${{ matrix.name }}.tar.gz"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 3. 发布：创建 Tag 与 GitHub Release，并把全部架构的产物作为 Release 资产上传
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish release
+    needs: [resolve, build]
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write   # softprops/action-gh-release 创建 Release、push tag 需要
+    env:
+      MUSL_VER: ${{ needs.resolve.outputs.musl_version }}
+      BUILD_DATE: ${{ needs.resolve.outputs.build_date }}
+      TAG: musl-${{ needs.resolve.outputs.musl_version }}-${{ needs.resolve.outputs.build_date }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 取完整 tag 历史，用于判断 tag 是否已存在
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Check assets and build SHA256SUMS
+        run: |
+          set -euo pipefail
+          ls -lh dist
+
+          missing=0
+          for arch in amd64 arm64 armv7 mips mipsle; do
+            f="dist/musl-${MUSL_VER}-${BUILD_DATE}-${arch}.tar.gz"
+            if [ ! -f "$f" ]; then
+              echo "::error::缺少产物 $f"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+
+          ( cd dist && sha256sum musl-*.tar.gz | sort -k2 > SHA256SUMS )
+          cat dist/SHA256SUMS
+
+      - name: Check if tag exists
+        id: check_tag
+        run: |
+          if git rev-parse -q --verify "refs/tags/$TAG" > /dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Tag $TAG 已存在，跳过 tag 创建，仅更新 Release 资产"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Git Tag
+        if: steps.check_tag.outputs.exists == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "Tag $TAG created"
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.TAG }}
+          name: musl ${{ env.MUSL_VER }} (${{ env.BUILD_DATE }})
+          body: |
+            ## musl ${{ env.MUSL_VER }}（${{ env.BUILD_DATE }} 构建，多架构交叉编译）
+
+            | 项目 | 值 |
+            | --- | --- |
+            | musl 版本 | `${{ env.MUSL_VER }}` |
+            | 构建日期（UTC） | `${{ env.BUILD_DATE }}` |
+            | 构建提交 | `${{ github.sha }}` |
+            | 构建方式 | x86_64 runner + [musl-cross-make](https://github.com/richfelker/musl-cross-make) 交叉编译 |
+
+            | 资产 | target | 说明 |
+            | --- | --- | --- |
+            | `musl-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-amd64.tar.gz` | `x86_64-linux-musl` | x86_64 |
+            | `musl-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-arm64.tar.gz` | `aarch64-linux-musl` | AArch64 |
+            | `musl-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-armv7.tar.gz` | `arm-linux-musleabihf` | ARMv7-A + VFPv3-D16，hard-float |
+            | `musl-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-mips.tar.gz` | `mips-linux-muslsf` | MIPS o32，大端，soft-float |
+            | `musl-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-mipsle.tar.gz` | `mipsel-linux-muslsf` | MIPS o32，小端，soft-float |
+
+            每个 tarball 只包含 musl 的 `lib/` 与 `include/`，解压后即可作为 sysroot 使用：
+
+            ```bash
+            mkdir -p /opt/musl-armv7
+            tar -C /opt/musl-armv7 -xzf musl-${{ env.MUSL_VER }}-${{ env.BUILD_DATE }}-armv7.tar.gz
+            arm-linux-musleabihf-gcc --sysroot=/opt/musl-armv7 hello.c
+            ```
+
+            - 校验：`sha256sum -c SHA256SUMS`
+            - `mips` / `mipsle` 默认 soft-float（o32）；需要 hard-float 时修改 workflow matrix 中的 target 后重新运行
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          make_latest: true
+          overwrite_files: true
+          files: |
+            dist/musl-*.tar.gz
+            dist/SHA256SUMS
+            dist/CONTENTS-*.txt
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
