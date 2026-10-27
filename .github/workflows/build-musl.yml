@@ -48,7 +48,7 @@ concurrency:
 
 env:
   MUSL_SITE: https://musl.libc.org
-  MCM_REPO: https://git.musl-libc.org/git/musl
+  MCM_REPO: https://github.com/richfelker/musl-cross-make
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -81,7 +81,7 @@ jobs:
 
           if [ -z "$ver" ]; then
             echo "::warning::解析 releases.html 失败，回退到 git tag"
-            ver="$(git ls-remote --tags --refs https://github.com/bminor/musl.git 'refs/tags/v*' \
+            ver="$(git ls-remote --tags --refs https://git.musl-libc.org/git/musl 'refs/tags/v*' \
               | sed -nE 's#.*refs/tags/v##p' \
               | grep -E '^[0-9]+(\.[0-9]+){1,2}$' \
               | sort -V | tail -n1 || true)"
